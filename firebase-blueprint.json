@@ -1,0 +1,57 @@
+{
+  "entities": {
+    "users": {
+      "title": "Users",
+      "description": "User accounts and permissions",
+      "type": "object",
+      "properties": {
+        "username": { "type": "string" },
+        "password": { "type": "string" },
+        "name": { "type": "string" },
+        "role": { "type": "string" },
+        "branch": { "type": "string" }
+      },
+      "required": ["username", "password"]
+    },
+    "projects": {
+      "title": "Projects",
+      "description": "ERP Projects",
+      "type": "object",
+      "properties": {
+        "code": { "type": "string" },
+        "name": { "type": "string" },
+        "branch": { "type": "string" },
+        "contractValue": { "type": "number" },
+        "status": { "type": "string" }
+      }
+    },
+    "labor": {
+      "title": "Labor Expenses",
+      "type": "object"
+    },
+    "materials": {
+      "title": "Material Expenses",
+      "type": "object"
+    },
+    "other_expenses": {
+      "title": "Other Expenses",
+      "type": "object"
+    },
+    "capitals": {
+      "title": "Capitals",
+      "type": "object"
+    },
+    "branches": {
+      "title": "Branches",
+      "type": "object"
+    },
+    "payslips": {
+      "title": "Payslips",
+      "type": "object"
+    },
+    "transfers": {
+      "title": "Stock Transfers",
+      "type": "object"
+    }
+  }
+}

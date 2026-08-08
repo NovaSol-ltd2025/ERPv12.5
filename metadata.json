@@ -1,0 +1,8 @@
+{
+  "name": "NovaSol ERP V12.0",
+  "description": "ระบบบริหารจัดการหลายสาขา NovaSol ERP V12.0",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
