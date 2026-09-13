@@ -1326,52 +1326,70 @@ async function runSupabase(funcName, ...args) {
   }
 
   if (funcName === 'getInventoryStatus') {
-    const branch = args[0] || '';
-    const supplies = ensureArray(await safeFetch('supplies', sb => sb.from('supplies').select('*'), []));
-    const discItems = ensureArray(await safeFetch('discontinued_items', sb => sb.from('discontinued_items').select('*'), []));
-    const discSet = new Set(discItems.filter(d => d.isDiscontinued).map(d => d.itemName));
+  const branch = args[0] || '';
+  const supplies = ensureArray(await safeFetch('supplies', sb => sb.from('supplies').select('*'), []));
+  const discItems = ensureArray(await safeFetch('discontinued_items', sb => sb.from('discontinued_items').select('*'), []));
+  const discSet = new Set(discItems.filter(d => d.isDiscontinued).map(d => d.itemName));
 
-    const map = {};
-    supplies.forEach(s => {
-      const item = s.itemName || '';
-      if (!item || isNonMaterialItem(item)) return;
-      const loc = s.deliveryLocation || 'สำนักงานใหญ่';
-      if (branch && branch !== 'ทุกสาขา' && loc !== branch) return;
+  // ── Central Stock: key = ชื่อสินค้าอย่างเดียว ไม่แยก location ──
+  const map = {};
 
-      const key = `${loc}::${item}`;
-      if (!map[key]) {
-        map[key] = { itemName: item, location: loc, inQty: 0, outQty: 0, lastPrice: 0 };
-      }
-      const qty = parseFloat(s.itemQuantity || 0);
-      const price = parseFloat(s.unitPrice || 0);
-      if (price > 0) map[key].lastPrice = price;
+  supplies.forEach(s => {
+    const item = s.itemName || '';
+    if (!item || isNonMaterialItem(item)) return;
 
-      if (s.actionType === 'รับเข้า' || s.actionType === 'ยอดยกมา') {
-        map[key].inQty += qty;
-      } else if (s.actionType === 'จ่ายออก') {
-        map[key].outQty += qty;
-      }
-    });
+    // ── รับเข้า: ไม่กรอง branch (สต็อกกลาง) ──
+    // ── จ่ายออก: กรอง branch ถ้าต้องการดูรายจ่ายของสาขานั้น ──
+    const loc = s.deliveryLocation || 'สำนักงานใหญ่';
 
-    return Object.values(map).map(i => {
-      const balance = i.inQty - i.outQty;
-      const status = balance <= 0 ? 'หมดเกลี้ยง' : (balance < 10 ? 'ใกล้หมด' : 'ปกติ');
-      return {
-        name: i.itemName,
-        itemName: i.itemName,
-        in: i.inQty,
-        inQty: i.inQty,
-        out: i.outQty,
-        outQty: i.outQty,
-        balance: balance,
-        status: status,
-        location: i.location,
-        unitPrice: i.lastPrice,
-        totalValue: balance * i.lastPrice,
-        isDiscontinued: discSet.has(i.itemName)
+    // key = ชื่อสินค้าอย่างเดียว → รวมทุกสาขาเป็นก้อนเดียว
+    const key = item;
+
+    if (!map[key]) {
+      map[key] = {
+        itemName: item,
+        inQty: 0,
+        outQty: 0,
+        lastPrice: 0,
+        outByBranch: {}  // เก็บรายจ่ายแยกสาขา
       };
-    });
-  }
+    }
+
+    const qty = parseFloat(s.itemQuantity || 0);
+    const price = parseFloat(s.unitPrice || 0);
+    if (price > 0) map[key].lastPrice = price;
+
+    if (s.actionType === 'รับเข้า' || s.actionType === 'ยอดยกมา') {
+      // รับเข้า → นับรวมทุกสาขา ไม่แยก
+      map[key].inQty += qty;
+    } else if (s.actionType === 'จ่ายออก') {
+      // ถ้าเลือกดูสาขาเฉพาะ → กรองเฉพาะจ่ายออกของสาขานั้น
+      if (branch && branch !== 'ทุกสาขา' && loc !== branch) return;
+      map[key].outQty += qty;
+      // บันทึกแยกสาขาเพื่อรายงาน
+      map[key].outByBranch[loc] = (map[key].outByBranch[loc] || 0) + qty;
+    }
+  });
+
+  return Object.values(map).map(i => {
+    const balance = i.inQty - i.outQty;
+    const status = balance <= 0 ? 'หมดเกลี้ยง' : (balance < 10 ? 'ใกล้หมด' : 'ปกติ');
+    return {
+      name: i.itemName,
+      itemName: i.itemName,
+      in: i.inQty,
+      inQty: i.inQty,
+      out: i.outQty,
+      outQty: i.outQty,
+      balance: balance,
+      status: status,
+      unitPrice: i.lastPrice,
+      totalValue: balance * i.lastPrice,
+      outByBranch: i.outByBranch,
+      isDiscontinued: discSet.has(i.itemName)
+    };
+  });
+}
 
   if (funcName === 'getMaterialList') {
     const supplies = ensureArray(await safeFetch('supplies', sb => sb.from('supplies').select('*'), []));
