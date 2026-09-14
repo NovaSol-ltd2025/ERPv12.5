@@ -1325,34 +1325,24 @@ async function runSupabase(funcName, ...args) {
     return reportRows;
   }
 
-  if (funcName === 'getInventoryStatus') {
+if (funcName === 'getInventoryStatus') {
   const branch = args[0] || '';
   const supplies = ensureArray(await safeFetch('supplies', sb => sb.from('supplies').select('*'), []));
   const discItems = ensureArray(await safeFetch('discontinued_items', sb => sb.from('discontinued_items').select('*'), []));
   const discSet = new Set(discItems.filter(d => d.isDiscontinued).map(d => d.itemName));
 
-  // ── Central Stock: key = ชื่อสินค้าอย่างเดียว ไม่แยก location ──
+  // Central Stock: key = ชื่อสินค้าอย่างเดียว ไม่แยก location
   const map = {};
 
   supplies.forEach(s => {
     const item = s.itemName || '';
     if (!item || isNonMaterialItem(item)) return;
 
-    // ── รับเข้า: ไม่กรอง branch (สต็อกกลาง) ──
-    // ── จ่ายออก: กรอง branch ถ้าต้องการดูรายจ่ายของสาขานั้น ──
     const loc = s.deliveryLocation || 'สำนักงานใหญ่';
-
-    // key = ชื่อสินค้าอย่างเดียว → รวมทุกสาขาเป็นก้อนเดียว
-    const key = item;
+    const key = item; // ← รวมทุกสาขาเป็นก้อนเดียว
 
     if (!map[key]) {
-      map[key] = {
-        itemName: item,
-        inQty: 0,
-        outQty: 0,
-        lastPrice: 0,
-        outByBranch: {}  // เก็บรายจ่ายแยกสาขา
-      };
+      map[key] = { itemName: item, inQty: 0, outQty: 0, lastPrice: 0, outByBranch: {} };
     }
 
     const qty = parseFloat(s.itemQuantity || 0);
@@ -1360,13 +1350,12 @@ async function runSupabase(funcName, ...args) {
     if (price > 0) map[key].lastPrice = price;
 
     if (s.actionType === 'รับเข้า' || s.actionType === 'ยอดยกมา') {
-      // รับเข้า → นับรวมทุกสาขา ไม่แยก
+      // รับเข้า → นับรวมทุกสาขา ไม่กรอง
       map[key].inQty += qty;
     } else if (s.actionType === 'จ่ายออก') {
       // ถ้าเลือกดูสาขาเฉพาะ → กรองเฉพาะจ่ายออกของสาขานั้น
       if (branch && branch !== 'ทุกสาขา' && loc !== branch) return;
       map[key].outQty += qty;
-      // บันทึกแยกสาขาเพื่อรายงาน
       map[key].outByBranch[loc] = (map[key].outByBranch[loc] || 0) + qty;
     }
   });
