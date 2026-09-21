@@ -182,16 +182,18 @@ function normalizeRow(d) {
   return res;
 }
 
-// Payload preparation helper: provides both camelCase and lowercase keys so Supabase PostgreSQL accepts them seamlessly
+// Payload preparation helper: converts camelCase JS keys to the lowercase
+// column names that actually exist in Supabase (Postgres folds unquoted
+// identifiers to lowercase, so every table's real columns are lowercase-only,
+// e.g. itemName -> itemname). PostgREST rejects an entire insert/update if ANY
+// key in the payload doesn't match a real column, so we must send ONLY the
+// lowercase form - never both - or every write fails with a
+// "Could not find the '<field>' column ... in the schema cache" error.
 function prepareSupabasePayload(payload) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return payload;
   const result = {};
   for (const key of Object.keys(payload)) {
-    const lowerKey = key.toLowerCase();
-    result[key] = payload[key];
-    if (lowerKey !== key) {
-      result[lowerKey] = payload[key];
-    }
+    result[key.toLowerCase()] = payload[key];
   }
   return result;
 }
@@ -265,19 +267,22 @@ async function safeFetch(tableName, fetchSupabaseFn, defaultData = []) {
 async function safeSave(tableName, saveSupabaseFn, localMutateFn, actionLabel = 'บันทึกข้อมูล') {
   const sb = getSupabase();
   let remoteSuccess = false;
+  let remoteErrorMessage = '';
   if (sb) {
     try {
       const res = await saveSupabaseFn(sb);
       if (res && res.error) {
-        console.warn(`Supabase save notice [${actionLabel}]:`, res.error.message);
+        remoteErrorMessage = res.error.message || String(res.error);
+        console.warn(`Supabase save notice [${actionLabel}]:`, remoteErrorMessage);
       } else {
         remoteSuccess = true;
       }
     } catch (e) {
-      console.warn(`Supabase network notice [${actionLabel}]:`, e.message || e);
+      remoteErrorMessage = e.message || String(e);
+      console.warn(`Supabase network notice [${actionLabel}]:`, remoteErrorMessage);
     }
   }
-  
+
   // Local Store mutation to guarantee 24/7 availability
   try {
     const current = getLocalCollection(tableName, []).map(normalizeRow);
@@ -287,9 +292,13 @@ async function safeSave(tableName, saveSupabaseFn, localMutateFn, actionLabel = 
     console.error(`Local save error on [${actionLabel}]:`, e);
   }
 
-  return { 
-    success: true, 
-    message: remoteSuccess ? `บันทึกข้อมูลเข้า Supabase สำเร็จ` : `บันทึกข้อมูลในระบบสำรองเรียบร้อย (ทำงาน 24 ชั่วโมง)`
+  return {
+    success: true,
+    remoteSuccess,
+    remoteError: remoteErrorMessage || null,
+    message: remoteSuccess
+      ? `บันทึกข้อมูลเข้า Supabase สำเร็จ`
+      : `⚠️ บันทึกได้เฉพาะในเครื่องนี้ ยังไม่ขึ้น Supabase (${remoteErrorMessage || 'ไม่ทราบสาเหตุ'}) ข้อมูลจะไม่ถูกเห็นจากเครื่องอื่นจนกว่าจะซิงก์สำเร็จ`
   };
 }
 
@@ -1489,7 +1498,7 @@ if (funcName === 'getInventoryStatus') {
     const payrollId = args[0] || '';
     const logs = await safeFetch('signature_logs', sb => {
       let q = sb.from('signature_logs').select('*');
-      if (payrollId) q = q.eq('payrollId', String(payrollId));
+      if (payrollId) q = q.eq('payrollid', String(payrollId));
       return q;
     }, []);
 
