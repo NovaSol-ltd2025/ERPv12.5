@@ -87,7 +87,7 @@
 <div id="loginOverlay">
   <div class="login-box shadow">
     <img src="https://i.postimg.cc/FHGkmGKB/NOVASOL-1/logo.png" style="width: 80px; margin-bottom: 15px;">
-    <h3 class="fw-bold mb-4">NovaSol ERP V12.0</h3>
+    <h3 class="fw-bold mb-4">NovaSol ERP V13.0</h3>
     <p class="text-muted small mb-1">ระบบบริหารจัดการหลายสาขา</p>
     <div class="mb-3"><span class="badge bg-light text-success border"><i class="fa-solid fa-database text-success me-1"></i> Supabase PostgreSQL (24/7 Engine)</span></div>
     <form id="loginForm" autocomplete="off">
@@ -3917,7 +3917,7 @@ window.copySupabaseShareLink = function() {
 };
 
 window.copySupabaseSQL = function() {
-  const sqlScript = `-- NovaSol ERP V12.0 - Supabase PostgreSQL Schema
+  const sqlScript = `-- NovaSol ERP V13.0 - Supabase PostgreSQL Schema
 CREATE TABLE IF NOT EXISTS public.users (id TEXT PRIMARY KEY, username TEXT, password TEXT, name TEXT, role TEXT, branch TEXT, created_at TIMESTAMPTZ DEFAULT NOW());
 CREATE TABLE IF NOT EXISTS public.branches (id TEXT PRIMARY KEY, name TEXT, address TEXT, manager TEXT, phone TEXT, openDate TEXT, status TEXT, created_at TIMESTAMPTZ DEFAULT NOW());
 CREATE TABLE IF NOT EXISTS public.contracts (id TEXT PRIMARY KEY, name TEXT, startDate TEXT, endDate TEXT, totalValue NUMERIC, laborBudget NUMERIC, status TEXT, created_at TIMESTAMPTZ DEFAULT NOW());
