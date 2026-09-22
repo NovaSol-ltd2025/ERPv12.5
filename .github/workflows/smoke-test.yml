@@ -1,1 +1,39 @@
+# .github/workflows/smoke-test.yml
+# รัน smoke test อัตโนมัติทุกครั้งที่ push ขึ้น main (หลัง Vercel deploy)
+# ถ้าพัง workflow จะขึ้นสีแดงใน GitHub และส่ง notification ตาม default ของ GitHub (email ให้ผู้ push)
+#
+# ต้องตั้งค่า repo secrets ก่อนใช้งาน (Settings > Secrets and variables > Actions):
+#   SUPABASE_URL, SUPABASE_ANON_KEY
+# และถ้าต้องการทดสอบ login ด้วย ให้เพิ่ม:
+#   SMOKE_TEST_USER, SMOKE_TEST_PASS
 
+name: Supabase Smoke Test
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+  schedule:
+    # รันซ้ำทุกวันตอนเช้า (เผื่อจับปัญหาที่ไม่ได้เกิดจากการ push โค้ด เช่น Supabase project ล่ม/key หมดอายุ)
+    - cron: '0 1 * * *'
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install supabase-js
+        run: npm install @supabase/supabase-js
+
+      - name: Run smoke test
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SMOKE_TEST_USER: ${{ secrets.SMOKE_TEST_USER }}
+          SMOKE_TEST_PASS: ${{ secrets.SMOKE_TEST_PASS }}
+        run: node scripts/smoke-test.mjs
