@@ -198,6 +198,96 @@ function prepareSupabasePayload(payload) {
   return result;
 }
 
+// ===== Pending Sync Queue =====
+// เมื่อบันทึกขึ้น Supabase ไม่สำเร็จ (เน็ตหลุด/เซิร์ฟเวอร์ล่มชั่วคราว) รายการจะถูกเก็บไว้ในคิวนี้
+// แล้วพยายามส่งซ้ำอัตโนมัติเป็นระยะ หรือทันทีที่เบราว์เซอร์กลับมาออนไลน์
+// เพื่อไม่ให้ข้อมูลค้างอยู่แค่ในเครื่องเดียวแบบเงียบๆ เหมือนที่เคยเกิดปัญหา
+const PENDING_SYNC_KEY = 'sb_pending_sync_queue';
+let isSyncingPendingQueue = false;
+
+function getPendingSyncQueue() {
+  try {
+    const raw = localStorage.getItem(PENDING_SYNC_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function savePendingSyncQueue(queue) {
+  try {
+    localStorage.setItem(PENDING_SYNC_KEY, JSON.stringify(queue));
+  } catch (e) {}
+}
+
+function addToPendingSync(tableName, op, payload) {
+  const queue = getPendingSyncQueue();
+  queue.push({
+    qid: 'q_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+    tableName,
+    op, // 'upsert' | 'delete'
+    payload, // for upsert: prepared row object; for delete: { id }
+    queuedAt: new Date().toISOString(),
+    attempts: 0
+  });
+  savePendingSyncQueue(queue);
+}
+
+async function logRemoteError(tableName, actionLabel, errorMessage) {
+  try {
+    const sb = getSupabase();
+    if (!sb) return;
+    await sb.from('error_logs').insert({
+      id: 'err_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+      table_name: tableName,
+      action_label: actionLabel,
+      error_message: String(errorMessage || '').slice(0, 1000),
+      device: (typeof navigator !== 'undefined' && navigator.userAgent) || ''
+    });
+  } catch (e) {
+    // ถ้า log ไม่สำเร็จก็แค่ปล่อยผ่าน ไม่ให้กระทบ flow หลัก
+  }
+}
+
+// พยายามส่งรายการที่ค้างอยู่ในคิวขึ้น Supabase อีกครั้ง เรียกได้บ่อยเท่าที่ต้องการ (กันชนกันด้วย isSyncingPendingQueue)
+async function attemptPendingSync() {
+  if (isSyncingPendingQueue) return;
+  const sb = getSupabase();
+  if (!sb) return;
+  let queue = getPendingSyncQueue();
+  if (!queue.length) return;
+
+  isSyncingPendingQueue = true;
+  const stillPending = [];
+
+  for (const item of queue) {
+    try {
+      let res;
+      if (item.op === 'delete') {
+        res = await sb.from(item.tableName).delete().eq('id', String(item.payload.id));
+      } else {
+        res = await sb.from(item.tableName).upsert(item.payload);
+      }
+      if (res && res.error) {
+        item.attempts = (item.attempts || 0) + 1;
+        stillPending.push(item);
+      }
+      // สำเร็จ -> ไม่ต้องเก็บต่อ (ไม่ push เข้า stillPending)
+    } catch (e) {
+      item.attempts = (item.attempts || 0) + 1;
+      stillPending.push(item);
+    }
+  }
+
+  savePendingSyncQueue(stillPending);
+  isSyncingPendingQueue = false;
+
+  if (stillPending.length === 0 && queue.length > 0) {
+    console.info(`✅ ซิงก์ข้อมูลที่ค้างอยู่ขึ้น Supabase สำเร็จทั้งหมด (${queue.length} รายการ)`);
+  }
+}
+
 // Storage helpers
 function getLocalCollection(tableName, defaultData = []) {
   try {
@@ -264,7 +354,8 @@ async function safeFetch(tableName, fetchSupabaseFn, defaultData = []) {
 }
 
 // Safe Save with Supabase -> Local Store
-async function safeSave(tableName, saveSupabaseFn, localMutateFn, actionLabel = 'บันทึกข้อมูล') {
+// syncInfo (optional): { op: 'upsert'|'delete', payload } - ใช้เพื่อเข้าคิว retry อัตโนมัติถ้าบันทึกขึ้น Supabase ไม่สำเร็จ
+async function safeSave(tableName, saveSupabaseFn, localMutateFn, actionLabel = 'บันทึกข้อมูล', syncInfo = null) {
   const sb = getSupabase();
   let remoteSuccess = false;
   let remoteErrorMessage = '';
@@ -281,6 +372,14 @@ async function safeSave(tableName, saveSupabaseFn, localMutateFn, actionLabel = 
       remoteErrorMessage = e.message || String(e);
       console.warn(`Supabase network notice [${actionLabel}]:`, remoteErrorMessage);
     }
+  }
+
+  if (!remoteSuccess && sb) {
+    // เข้าคิวไว้ retry อัตโนมัติภายหลัง กันข้อมูลค้างเงียบๆ ในเครื่องเดียว
+    if (syncInfo && syncInfo.payload) {
+      addToPendingSync(tableName, syncInfo.op || 'upsert', syncInfo.payload);
+    }
+    logRemoteError(tableName, actionLabel, remoteErrorMessage);
   }
 
   // Local Store mutation to guarantee 24/7 availability
@@ -384,20 +483,32 @@ async function runSupabase(funcName, ...args) {
     const username = (args[0] || '').trim();
     const password = (args[1] || '').trim();
 
-    return safeFetch('users', async (sb) => {
-      const { data, error } = await sb.from('users').select('*').eq('username', username).eq('password', password);
-      if (!error && data && data.length > 0) {
-        const u = normalizeRow(data[0]);
-        return {
-          success: true,
-          name: u.name,
-          role: u.role,
-          branch: u.branch || 'ทุกสาขา',
-          token: 'sb_' + u.id + '_' + Date.now()
-        };
+    const sbClient = getSupabase();
+    if (sbClient) {
+      try {
+        // ตรวจรหัสผ่านฝั่ง DB ด้วย bcrypt ผ่าน RPC (client ไม่เห็น hash หรือ password ใครเลย)
+        const { data, error } = await sbClient.rpc('verify_login', { p_username: username, p_password: password });
+        if (!error && data && data.length > 0) {
+          const u = data[0];
+          return {
+            success: true,
+            name: u.name,
+            role: u.role,
+            branch: u.branch || 'ทุกสาขา',
+            token: 'sb_' + u.id + '_' + Date.now()
+          };
+        }
+        if (!error) {
+          return { success: false, message: 'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง' };
+        }
+        console.warn('verify_login RPC notice:', error.message);
+      } catch (e) {
+        console.warn('verify_login RPC network notice:', e.message || e);
       }
-      return null;
-    }, [
+    }
+
+    // Local fallback (ใช้เฉพาะตอนต่อ Supabase ไม่ได้จริงๆ)
+    return safeFetch('users', async () => null, [
       { row: 'u1', id: 'u1', username: 'admin', password: '123', name: 'ผู้ดูแลระบบ (Admin)', role: 'Admin', branch: 'ทุกสาขา' },
       { row: 'u2', id: 'u2', username: 'manager', password: '123', name: 'ผู้ควบคุมงาน', role: 'ผู้ควบคุมงาน', branch: 'สำนักงานใหญ่' },
       { row: 'u3', id: 'u3', username: 'head', password: '123', name: 'หัวหน้างาน', role: 'หัวหน้างาน', branch: 'สำนักงานใหญ่' }
@@ -457,7 +568,8 @@ async function runSupabase(funcName, ...args) {
         if (idx >= 0) list[idx] = item; else list.push(item);
         return list;
       },
-      'บันทึกสาขา'
+      'บันทึกสาขา',
+      { op: 'upsert', payload: prepareSupabasePayload(payload) }
     );
   }
 
@@ -466,7 +578,8 @@ async function runSupabase(funcName, ...args) {
     return safeSave('branches',
       sb => sb.from('branches').delete().eq('id', String(id)),
       list => list.filter(b => String(b.id) !== String(id)),
-      'ลบสาขา'
+      'ลบสาขา',
+      { op: 'delete', payload: { id: String(id) } }
     );
   }
 
@@ -516,7 +629,8 @@ async function runSupabase(funcName, ...args) {
         if (idx >= 0) list[idx] = item; else list.push(item);
         return list;
       },
-      'บันทึกสัญญา'
+      'บันทึกสัญญา',
+      { op: 'upsert', payload: prepareSupabasePayload(payload) }
     );
   }
 
@@ -525,7 +639,8 @@ async function runSupabase(funcName, ...args) {
     return safeSave('contracts',
       sb => sb.from('contracts').delete().eq('id', String(id)),
       list => list.filter(c => String(c.id) !== String(id)),
-      'ลบสัญญา'
+      'ลบสัญญา',
+      { op: 'delete', payload: { id: String(id) } }
     );
   }
 
@@ -578,7 +693,8 @@ async function runSupabase(funcName, ...args) {
         if (idx >= 0) list[idx] = item; else list.push(item);
         return list;
       },
-      'บันทึกข้อมูลคนงาน'
+      'บันทึกข้อมูลคนงาน',
+      { op: 'upsert', payload: prepareSupabasePayload(payload) }
     );
   }
 
@@ -587,7 +703,8 @@ async function runSupabase(funcName, ...args) {
     return safeSave('workers',
       sb => sb.from('workers').delete().eq('id', String(id)),
       list => list.filter(w => String(w.id) !== String(id)),
-      'ลบข้อมูลคนงาน'
+      'ลบข้อมูลคนงาน',
+      { op: 'delete', payload: { id: String(id) } }
     );
   }
 
@@ -596,7 +713,8 @@ async function runSupabase(funcName, ...args) {
     return safeSave('workers',
       sb => sb.from('workers').update({ branch: newBranch }).eq('id', String(id)),
       list => list.map(w => String(w.id) === String(id) ? { ...w, branch: newBranch } : w),
-      'โอนย้ายคนงาน'
+      'โอนย้ายคนงาน',
+      { op: 'upsert', payload: { id: String(id), branch: newBranch } }
     ).then(() => ({ success: true, message: `โอนย้ายคนงานไปสาขา ${newBranch} เรียบร้อย` }));
   }
 
@@ -665,7 +783,8 @@ async function runSupabase(funcName, ...args) {
         if (idx >= 0) list[idx] = item; else list.push(item);
         return list;
       },
-      'บันทึกรายการวัสดุ'
+      'บันทึกรายการวัสดุ',
+      { op: 'upsert', payload: prepareSupabasePayload(payload) }
     );
   }
 
@@ -674,7 +793,8 @@ async function runSupabase(funcName, ...args) {
     return safeSave('supplies',
       sb => sb.from('supplies').delete().eq('id', String(id)),
       list => list.filter(s => String(s.id) !== String(id)),
-      'ลบรายการวัสดุ'
+      'ลบรายการวัสดุ',
+      { op: 'delete', payload: { id: String(id) } }
     );
   }
 
@@ -711,7 +831,8 @@ async function runSupabase(funcName, ...args) {
         if (idx >= 0) list[idx] = item; else list.push(item);
         return list;
       },
-      'บันทึกคำขอเบิก'
+      'บันทึกคำขอเบิก',
+      { op: 'upsert', payload: prepareSupabasePayload(payload) }
     );
   }
 
@@ -720,7 +841,8 @@ async function runSupabase(funcName, ...args) {
     return safeSave('requests',
       sb => sb.from('requests').delete().eq('id', String(id)),
       list => list.filter(r => String(r.id) !== String(id)),
-      'ลบคำขอเบิก'
+      'ลบคำขอเบิก',
+      { op: 'delete', payload: { id: String(id) } }
     );
   }
 
@@ -729,7 +851,8 @@ async function runSupabase(funcName, ...args) {
     return safeSave('requests',
       sb => sb.from('requests').update({ status, approver }).eq('id', String(id)),
       list => list.map(r => String(r.id) === String(id) ? { ...r, status, approver } : r),
-      'อัปเดตสถานะคำขอเบิก'
+      'อัปเดตสถานะคำขอเบิก',
+      { op: 'upsert', payload: { id: String(id), status, approver } }
     );
   }
 
@@ -775,7 +898,8 @@ async function runSupabase(funcName, ...args) {
         if (idx >= 0) list[idx] = item; else list.push(item);
         return list;
       },
-      'บันทึกข้อมูลเงินเดือน'
+      'บันทึกข้อมูลเงินเดือน',
+      { op: 'upsert', payload: prepareSupabasePayload(payload) }
     );
   }
 
@@ -784,7 +908,8 @@ async function runSupabase(funcName, ...args) {
     return safeSave('payrolls',
       sb => sb.from('payrolls').delete().eq('id', String(id)),
       list => list.filter(p => String(p.id) !== String(id)),
-      'ลบข้อมูลเงินเดือน'
+      'ลบข้อมูลเงินเดือน',
+      { op: 'delete', payload: { id: String(id) } }
     );
   }
 
@@ -843,7 +968,8 @@ async function runSupabase(funcName, ...args) {
         if (idx >= 0) list[idx] = item; else list.push(item);
         return list;
       },
-      'บันทึกการเพิ่มทุน'
+      'บันทึกการเพิ่มทุน',
+      { op: 'upsert', payload: prepareSupabasePayload(payload) }
     );
   }
 
@@ -852,14 +978,16 @@ async function runSupabase(funcName, ...args) {
     return safeSave('capitals',
       sb => sb.from('capitals').delete().eq('id', String(id)),
       list => list.filter(c => String(c.id) !== String(id)),
-      'ลบการเพิ่มทุน'
+      'ลบการเพิ่มทุน',
+      { op: 'delete', payload: { id: String(id) } }
     );
   }
 
   // USERS MANAGEMENT (Support both getUsersList and getUsersData)
   if (funcName === 'getUsersList' || funcName === 'getUsersData') {
+    // ใช้ view users_safe ที่ไม่มีคอลัมน์ password เลย (ตาราง users จริงปิด SELECT ตรงไว้แล้ว)
     return safeFetch('users', async (sb) => {
-      const { data, error } = await sb.from('users').select('*');
+      const { data, error } = await sb.from('users_safe').select('*');
       if (error) throw error;
       return (data || []).map(normalizeRow);
     }, [
@@ -872,34 +1000,84 @@ async function runSupabase(funcName, ...args) {
   if (funcName === 'saveUser') {
     const data = args[0] || {};
     const row = data.row || 'u_' + Date.now();
-    const payload = {
-      id: String(row),
-      username: data.user || data.username || '',
-      password: data.pass || data.password || '',
-      name: data.name || '',
-      role: data.role || 'หัวหน้างาน',
-      branch: data.branch || 'ทุกสาขา'
-    };
+    const username = data.user || data.username || '';
+    const passwordPlain = data.pass || data.password || '';
+    const name = data.name || '';
+    const role = data.role || 'หัวหน้างาน';
+    const branch = data.branch || 'ทุกสาขา';
 
-    return safeSave('users',
-      sb => sb.from('users').upsert(prepareSupabasePayload(payload)),
-      list => {
-        const idx = list.findIndex(u => String(u.row || u.id) === String(row));
-        const item = normalizeRow({ ...payload, row: payload.id });
-        if (idx >= 0) list[idx] = item; else list.push(item);
-        return list;
-      },
-      'บันทึกผู้ใช้'
-    );
+    const sb = getSupabase();
+    let remoteSuccess = false;
+    let remoteErrorMessage = '';
+    if (sb) {
+      try {
+        // RPC นี้ hash รหัสผ่านให้อัตโนมัติฝั่ง DB ไม่มีการส่ง plain text เข้าตารางตรงๆ
+        const { error } = await sb.rpc('set_user_password', {
+          p_id: String(row),
+          p_username: username,
+          p_password: passwordPlain,
+          p_name: name,
+          p_role: role,
+          p_branch: branch
+        });
+        if (error) {
+          remoteErrorMessage = error.message || String(error);
+          console.warn('Supabase save notice [บันทึกผู้ใช้]:', remoteErrorMessage);
+          logRemoteError('users', 'บันทึกผู้ใช้', remoteErrorMessage);
+        } else {
+          remoteSuccess = true;
+        }
+      } catch (e) {
+        remoteErrorMessage = e.message || String(e);
+        console.warn('Supabase network notice [บันทึกผู้ใช้]:', remoteErrorMessage);
+      }
+    }
+
+    try {
+      const current = getLocalCollection('users', []).map(normalizeRow);
+      const idx = current.findIndex(u => String(u.row || u.id) === String(row));
+      // ไม่เก็บ password plain text ไว้ใน local cache เช่นกัน
+      const item = normalizeRow({ id: String(row), row: String(row), username, name, role, branch });
+      if (idx >= 0) current[idx] = item; else current.push(item);
+      saveLocalCollection('users', current);
+    } catch (e) {}
+
+    return {
+      success: true,
+      message: remoteSuccess
+        ? 'บันทึกข้อมูลเข้า Supabase สำเร็จ'
+        : `⚠️ บันทึกผู้ใช้ไม่สำเร็จ (${remoteErrorMessage || 'ไม่ทราบสาเหตุ'}) กรุณาลองใหม่เมื่อเชื่อมต่อ Supabase ได้`
+    };
   }
 
   if (funcName === 'deleteUser') {
     const row = args[0];
-    return safeSave('users',
-      sb => sb.from('users').delete().eq('id', String(row)),
-      list => list.filter(u => String(u.row || u.id) !== String(row)),
-      'ลบผู้ใช้'
-    );
+    const sb = getSupabase();
+    let remoteSuccess = false;
+    let remoteErrorMessage = '';
+    if (sb) {
+      try {
+        const { error } = await sb.rpc('delete_user', { p_id: String(row) });
+        if (error) {
+          remoteErrorMessage = error.message || String(error);
+          logRemoteError('users', 'ลบผู้ใช้', remoteErrorMessage);
+        } else {
+          remoteSuccess = true;
+        }
+      } catch (e) {
+        remoteErrorMessage = e.message || String(e);
+      }
+    }
+
+    try {
+      const current = getLocalCollection('users', []).map(normalizeRow);
+      saveLocalCollection('users', current.filter(u => String(u.row || u.id) !== String(row)));
+    } catch (e) {}
+
+    return {
+      success: true,
+      message: remoteSuccess ? 'ลบผู้ใช้เข้า Supabase สำเร็จ' : `⚠️ ลบผู้ใช้ไม่สำเร็จ (${remoteErrorMessage || 'ไม่ทราบสาเหตุ'})`
+    };
   }
 
   // DASHBOARD & STATS
@@ -961,7 +1139,8 @@ async function runSupabase(funcName, ...args) {
         if (idx >= 0) list[idx] = item; else list.push(item);
         return list;
       },
-      'บันทึกผลการตรวจนับสต๊อก'
+      'บันทึกผลการตรวจนับสต๊อก',
+      { op: 'upsert', payload: prepareSupabasePayload(payload) }
     );
   }
 
@@ -970,7 +1149,8 @@ async function runSupabase(funcName, ...args) {
     return safeSave('stock_audits',
       sb => sb.from('stock_audits').delete().eq('id', String(id)),
       list => list.filter(a => String(a.id) !== String(id)),
-      'ลบการตรวจนับสต๊อก'
+      'ลบการตรวจนับสต๊อก',
+      { op: 'delete', payload: { id: String(id) } }
     );
   }
 
@@ -1024,7 +1204,8 @@ async function runSupabase(funcName, ...args) {
         if (idx >= 0) list[idx] = item; else list.push(item);
         return list;
       },
-      'บันทึกใบสั่งซื้อ'
+      'บันทึกใบสั่งซื้อ',
+      { op: 'upsert', payload: prepareSupabasePayload(payload) }
     );
   }
 
@@ -1033,7 +1214,8 @@ async function runSupabase(funcName, ...args) {
     return safeSave('purchase_orders',
       sb => sb.from('purchase_orders').delete().eq('id', String(id)),
       list => list.filter(p => String(p.id) !== String(id)),
-      'ลบใบสั่งซื้อ'
+      'ลบใบสั่งซื้อ',
+      { op: 'delete', payload: { id: String(id) } }
     );
   }
 
@@ -1488,7 +1670,8 @@ if (funcName === 'getInventoryStatus') {
     await safeSave('signature_logs',
       sb => sb.from('signature_logs').upsert(prepareSupabasePayload(logPayload)),
       list => { list.push(logPayload); return list; },
-      'บันทึกประวัติการเซ็น'
+      'บันทึกประวัติการเซ็น',
+      { op: 'upsert', payload: prepareSupabasePayload(logPayload) }
     );
 
     return { success: true, signedAt };
@@ -1508,6 +1691,15 @@ if (funcName === 'getInventoryStatus') {
   return { success: true };
 }
 
+// เรียกซิงก์รายการที่ค้างอยู่ทันทีตอนโหลดหน้า, ทุก 60 วินาที, และทันทีที่เน็ตกลับมาใช้ได้
+if (typeof window !== 'undefined') {
+  setTimeout(() => attemptPendingSync(), 3000);
+  setInterval(() => attemptPendingSync(), 60000);
+  window.addEventListener('online', () => attemptPendingSync());
+}
+
 window.runSupabase = runSupabase;
 window.runGoogle = runSupabase;
 window.runFirebase = runSupabase;
+window.attemptPendingSync = attemptPendingSync;
+window.getPendingSyncQueue = getPendingSyncQueue;
